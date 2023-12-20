@@ -1,0 +1,8 @@
+.DS_STORE
+.vscode
+.idea
+.devcontainer
+dist
+vendor/
+# pagode binary
+cmd/pagode/pagode
