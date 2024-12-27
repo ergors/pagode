@@ -4,35 +4,38 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger"
 	fileutil "github.com/projectdiscovery/utils/file"
+	folderutil "github.com/projectdiscovery/utils/folder"
 	logutil "github.com/projectdiscovery/utils/log"
-	updateutils "github.com/projectdiscovery/utils/update"
+	"gopkg.in/yaml.v3"
+)
+
+var (
+	configDir             = folderutil.AppConfigDirOrDefault(".", "pagode")
+	defaultConfigLocation = filepath.Join(configDir, "config.yaml")
 )
 
 // Options contains the configuration options for tuning
 // the google enumeration process.
 type Options struct {
-	Verbose            bool                // Verbose flag indicates whether to show verbose output or not
-	NoColor            bool                // NoColor disables the colored output
-	JSON               bool                // JSON specifies whether to use json for output format or text file
-	Silent             bool                // Silent suppresses any extra text and only writes results to screen
-	Stdin              bool                // Stdin specifies whether stdin input was given to the process
-	Version            bool                // Version specifies if we should just show version and exit
-	GHDB               bool                // Fetch Google Hacking Database
-	Threads            int                 // Threads controls the number of threads to use for enumerations
-	Dork               goflags.StringSlice // Dork is the dork(s) to search with
-	DorksFile          string              // DorksFile is the file containing list of dorks to search with
-	Domain             string              // Domain is the domain to specify in the searches
-	Output             io.Writer
-	OutputFile         string              // Output is the file to write found subdomains to.
-	Proxy              goflags.StringSlice // HTTP/HTTPS/SOCKS5 proxy(s)
-	ProxyFile          string              // File containing list of proxies to use
-	Interval           int                 // Seconds to wait between dork searches
-	Results            int                 // Maximum number of results per search
-	DisableUpdateCheck bool                // DisableUpdateCheck disable update checking
+	Verbose    bool                // Verbose flag indicates whether to show verbose output or not
+	NoColor    bool                // NoColor disables the colored output
+	Silent     bool                // Silent suppresses any extra text and only writes results to screen
+	Stdin      bool                // Stdin specifies whether stdin input was given to the process
+	Version    bool                // Version specifies if we should just show version and exit
+	Threads    int                 // Threads controls the number of threads to use for enumerations
+	Dork       goflags.StringSlice // Dork is the dork(s) to search with
+	DorksFile  string              // DorksFile is the file containing list of dorks to search with
+	Domain     string              // Domain to specify in the searches
+	Output     io.Writer
+	OutputFile string // Output is the file to write results to.
+	Proxy      string // proxy URL to use for the requests
+	Results    int    // Maximum number of results per search
+	Config     string // Config contains the location of the config file
 }
 
 // ParseOptions parses the command line flags provided by a user
@@ -43,32 +46,23 @@ func ParseOptions() *Options {
 
 	var err error
 	flagSet := goflags.NewFlagSet()
-	flagSet.SetDescription(`Pagode is a google dorking enumeration tool.`)
+	flagSet.SetDescription(`Pagode is a passive google dorking enumeration tool.`)
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&options.Dork, "dork", "g", nil, "dork to search with", goflags.NormalizedStringSliceOptions),
-		flagSet.StringVarP(&options.DorksFile, "list", "gL", "", "file containing list of dorks to search with"),
-		flagSet.StringVarP(&options.Domain, "domain", "d", "", `domain to search with "site:" dork`),
-	)
-
-	flagSet.CreateGroup("rate-limit", "Rate-limit",
-		flagSet.IntVarP(&options.Interval, "interval", "i", 1, "seconds to wait between searches"),
-		flagSet.IntVarP(&options.Results, "results", "r", 100, "maximum number of results per search"),
-	)
-
-	flagSet.CreateGroup("update", "Update",
-		flagSet.CallbackVarP(GetUpdateCallback(), "update", "up", "update subfinder to latest version"),
-		flagSet.BoolVarP(&options.DisableUpdateCheck, "disable-update-check", "duc", false, "disable automatic subfinder update check"),
+		flagSet.StringSliceVarP(&options.Dork, "dork", "g", nil, "dork to search", goflags.NormalizedStringSliceOptions),
+		flagSet.StringVarP(&options.DorksFile, "list", "gL", "", "file containing a list of dorks to search"),
+		flagSet.StringVarP(&options.Domain, "domain", "d", "", `domain to search with "site:" operator`),
 	)
 
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&options.OutputFile, "output", "o", "", "file to write output to"),
-		flagSet.BoolVarP(&options.JSON, "json", "oJ", false, "write output in JSONL(ines) format"),
 	)
 
 	flagSet.CreateGroup("configuration", "Configuration",
-		flagSet.StringSliceVarP(&options.Proxy, "proxy", "p", nil, "HTTP(s)/SOCKS5 proxy to use with pagode", goflags.NormalizedStringSliceOptions),
-		flagSet.StringVarP(&options.ProxyFile, "plist", "pL", "", "file containing list of proxies to use"),
+		flagSet.StringVarP(&options.Config, "config", "c", defaultConfigLocation, "config file for API keys"),
+		flagSet.StringVarP(&options.Proxy, "proxy", "p", "", "HTTP(s)/SOCKS5 proxy to use with pagode"),
+		flagSet.IntVarP(&options.Results, "max", "m", 0, "maximum number of results per search"),
+		flagSet.IntVarP(&options.Threads, "threads", "t", 10, "number of concurrent goroutines for querying"),
 	)
 
 	flagSet.CreateGroup("debug", "Debug",
@@ -103,7 +97,7 @@ func ParseOptions() *Options {
 		showBanner()
 	}
 
-	// We need pagode on pdtm api
+	/* We need pagode on pdtm api
 	if !options.DisableUpdateCheck {
 		latestVersion, err := updateutils.GetToolVersionCallback("pagode", version)()
 		if err != nil {
@@ -114,6 +108,7 @@ func ParseOptions() *Options {
 			gologger.Info().Msgf("Current pagode version %v %v", version, updateutils.GetVersionDescription(version, latestVersion))
 		}
 	}
+	*/
 
 	// Validate the options passed by the user and if any
 	// invalid options have been used, exit.
@@ -129,4 +124,18 @@ func (options *Options) preProcessOptions() {
 	for i, dork := range options.Dork {
 		options.Dork[i], _ = sanitize(dork)
 	}
+}
+
+// UnmarshalFrom reads the marshaled yaml config from disk
+func (options *Options) UnmarshalFrom(file string) (map[string][]string, error) {
+	reader, err := fileutil.SubstituteConfigFromEnvVars(file)
+	if err != nil {
+		return nil, err
+	}
+	sourceApiKeysMap := map[string][]string{}
+	err = yaml.NewDecoder(reader).Decode(sourceApiKeysMap)
+	if err != nil {
+		return nil, err
+	}
+	return sourceApiKeysMap, nil
 }

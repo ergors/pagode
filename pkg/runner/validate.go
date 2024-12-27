@@ -2,23 +2,18 @@ package runner
 
 import (
 	"errors"
-	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/gologger/formatter"
 	"github.com/projectdiscovery/gologger/levels"
-	"github.com/projectdiscovery/subfinder/v2/pkg/passive"
-	mapsutil "github.com/projectdiscovery/utils/maps"
-	sliceutil "github.com/projectdiscovery/utils/slice"
 )
 
 // validateOptions validates the configuration options passed
 func (options *Options) validateOptions() error {
-	// Check if domain, list of domains, or stdin info was provided.
+	// Check if dork, list of dork, or stdin info was provided.
 	// If none was provided, then return.
-	if len(options.Domain) == 0 && options.DomainsFile == "" && !options.Stdin {
+	if len(options.Dork) == 0 && options.DorksFile == "" && !options.Stdin {
 		return errors.New("no input list provided")
 	}
 
@@ -31,46 +26,12 @@ func (options *Options) validateOptions() error {
 	if options.Threads == 0 {
 		return errors.New("threads cannot be zero")
 	}
-	if options.Timeout == 0 {
-		return errors.New("timeout cannot be zero")
+
+	if options.Results < 0 {
+		return errors.New("results cannot be negative")
 	}
 
-	// Always remove wildcard with hostip
-	if options.HostIP && !options.RemoveWildcard {
-		return errors.New("hostip flag must be used with RemoveWildcard option")
-	}
-
-	if options.Match != nil {
-		options.matchRegexes = make([]*regexp.Regexp, len(options.Match))
-		var err error
-		for i, re := range options.Match {
-			if options.matchRegexes[i], err = regexp.Compile(stripRegexString(re)); err != nil {
-				return errors.New("invalid value for match regex option")
-			}
-		}
-	}
-	if options.Filter != nil {
-		options.filterRegexes = make([]*regexp.Regexp, len(options.Filter))
-		var err error
-		for i, re := range options.Filter {
-			if options.filterRegexes[i], err = regexp.Compile(stripRegexString(re)); err != nil {
-				return errors.New("invalid value for filter regex option")
-			}
-		}
-	}
-
-	sources := mapsutil.GetKeys(passive.NameSourceMap)
-	for source := range options.RateLimits.AsMap() {
-		if !sliceutil.Contains(sources, source) {
-			return fmt.Errorf("invalid source %s specified in -rls flag", source)
-		}
-	}
 	return nil
-}
-func stripRegexString(val string) string {
-	val = strings.ReplaceAll(val, ".", "\\.")
-	val = strings.ReplaceAll(val, "*", ".*")
-	return fmt.Sprint("^", val, "$")
 }
 
 // configureOutput configures the output on the screen
@@ -85,4 +46,12 @@ func (options *Options) configureOutput() {
 	if options.Silent {
 		gologger.DefaultLogger.SetMaxLevel(levels.LevelSilent)
 	}
+}
+
+func sanitize(data string) (string, error) {
+	data = strings.Trim(data, "\n\t\"' ")
+	if data == "" {
+		return "", errors.New("empty data")
+	}
+	return data, nil
 }

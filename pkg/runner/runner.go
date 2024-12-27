@@ -2,28 +2,21 @@ package runner
 
 import (
 	"bufio"
-	"context"
+	"errors"
 	"io"
-	"math"
 	"os"
-	"path"
-	"regexp"
 	"strings"
-
-	"github.com/pkg/errors"
+	"sync"
 
 	"github.com/projectdiscovery/gologger"
 	fileutil "github.com/projectdiscovery/utils/file"
-	mapsutil "github.com/projectdiscovery/utils/maps"
-
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
-// Runner is an instance of the subdomain enumeration
+// Runner is an instance of the dork enumeration
 // client used to orchestrate the whole process.
 type Runner struct {
 	options      *Options
-	dorkingAgent *dorking.Agent
+	dorkingAgent *Agent
 }
 
 // NewRunner creates a new runner struct instance by parsing
@@ -34,127 +27,162 @@ func NewRunner(options *Options) (*Runner, error) {
 
 	// Check if the application loading with any provider configuration, then take it
 	// Otherwise load the default provider config
-	if fileutil.FileExists(options.ProviderConfig) {
-		gologger.Info().Msgf("Loading provider config from %s", options.ProviderConfig)
-		options.loadProvidersFrom(options.ProviderConfig)
-	} else {
-		gologger.Info().Msgf("Loading provider config from the default location: %s", defaultProviderConfigLocation)
-		options.loadProvidersFrom(defaultProviderConfigLocation)
+	if !fileutil.FileExists(options.Config) {
+		// Create the default configuration file
+		file, err := os.Create(options.Config)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
 	}
 
-	// Initialize the passive subdomain enumeration engine
-	runner.initializePassiveEngine()
-
-	// Initialize the subdomain resolver
-	err := runner.initializeResolver()
+	gologger.Info().Msgf("Loading config from %s", options.Config)
+	source, err := options.UnmarshalFrom(options.Config)
 	if err != nil {
 		return nil, err
 	}
-
-	// Initialize the custom rate limit
-	runner.rateLimit = &subscraping.CustomRateLimit{
-		Custom: mapsutil.SyncLockMap[string, uint]{
-			Map: make(map[string]uint),
-		},
-	}
-
-	for source, sourceRateLimit := range options.RateLimits.AsMap() {
-		if sourceRateLimit.MaxCount > 0 && sourceRateLimit.MaxCount <= math.MaxUint {
-			_ = runner.rateLimit.Custom.Set(source, sourceRateLimit.MaxCount)
+	apiKeys := []string{}
+	searchIds := []string{}
+	for _, value := range source["google"] {
+		keys := strings.Split(value, ":")
+		if len(keys) != 2 {
+			gologger.Warning().Msgf("Invalid google dork: %s", value)
+			continue
 		}
+		gologger.Debug().Msgf("Adding API key: %s Search ID: %s", keys[0], keys[1])
+		apiKeys = append(apiKeys, keys[0])
+		searchIds = append(searchIds, keys[1])
 	}
+	if len(apiKeys) == 0 || len(searchIds) == 0 {
+		return nil, errors.New("no valid google dork found")
+	}
+	agent := NewAgent(apiKeys, searchIds, options.Proxy)
+	runner.dorkingAgent = agent
 
 	return runner, nil
 }
 
 // RunEnumeration wraps RunEnumerationWithCtx with an empty context
 func (r *Runner) RunEnumeration() error {
-	return r.RunEnumerationWithCtx(context.Background())
-}
-
-// RunEnumerationWithCtx runs the subdomain enumeration flow on the targets specified
-func (r *Runner) RunEnumerationWithCtx(ctx context.Context) error {
-	outputs := []io.Writer{r.options.Output}
-
-	if len(r.options.Domain) > 0 {
-		domainsReader := strings.NewReader(strings.Join(r.options.Domain, "\n"))
-		return r.EnumerateMultipleDomainsWithCtx(ctx, domainsReader, outputs)
+	if r.options.Dork != nil {
+		dorksReader := strings.NewReader(strings.Join(r.options.Dork, "\n"))
+		return r.EnumerateDorks(dorksReader, r.options.Output)
 	}
-
-	// If we have multiple domains as input,
-	if r.options.DomainsFile != "" {
-		f, err := os.Open(r.options.DomainsFile)
+	if r.options.DorksFile != "" {
+		f, err := os.Open(r.options.DorksFile)
 		if err != nil {
 			return err
 		}
-		err = r.EnumerateMultipleDomainsWithCtx(ctx, f, outputs)
+		err = r.EnumerateDorks(f, r.options.Output)
 		f.Close()
 		return err
 	}
-
-	// If we have STDIN input, treat it as multiple domains
 	if r.options.Stdin {
-		return r.EnumerateMultipleDomainsWithCtx(ctx, os.Stdin, outputs)
+		return r.EnumerateDorks(os.Stdin, r.options.Output)
 	}
 	return nil
 }
 
-// EnumerateMultipleDomains wraps EnumerateMultipleDomainsWithCtx with an empty context
-func (r *Runner) EnumerateMultipleDomains(reader io.Reader, writers []io.Writer) error {
-	return r.EnumerateMultipleDomainsWithCtx(context.Background(), reader, writers)
-}
+func (r *Runner) EnumerateDorks(reader io.Reader, writer io.Writer) error {
+	var outputWriter io.Writer = writer
 
-// EnumerateMultipleDomainsWithCtx enumerates subdomains for multiple domains
-// We keep enumerating subdomains for a given domain until we reach an error
-func (r *Runner) EnumerateMultipleDomainsWithCtx(ctx context.Context, reader io.Reader, writers []io.Writer) error {
-	scanner := bufio.NewScanner(reader)
-	ip, _ := regexp.Compile(`^([0-9\.]+$)`)
-	for scanner.Scan() {
-		domain, err := sanitize(scanner.Text())
-		isIp := ip.MatchString(domain)
-		if errors.Is(err, ErrEmptyInput) || (r.options.ExcludeIps && isIp) {
-			continue
-		}
-
-		var file *os.File
-		// If the user has specified an output file, use that output file instead
-		// of creating a new output file for each domain. Else create a new file
-		// for each domain in the directory.
-		if r.options.OutputFile != "" {
-			outputWriter := NewOutputWriter(r.options.JSON)
-			file, err = outputWriter.createFile(r.options.OutputFile, true)
-			if err != nil {
-				gologger.Error().Msgf("Could not create file %s for %s: %s\n", r.options.OutputFile, r.options.Domain, err)
-				return err
-			}
-
-			err = r.EnumerateSingleDomainWithCtx(ctx, domain, append(writers, file))
-
-			file.Close()
-		} else if r.options.OutputDirectory != "" {
-			outputFile := path.Join(r.options.OutputDirectory, domain)
-			if r.options.JSON {
-				outputFile += ".json"
-			} else {
-				outputFile += ".txt"
-			}
-
-			outputWriter := NewOutputWriter(r.options.JSON)
-			file, err = outputWriter.createFile(outputFile, false)
-			if err != nil {
-				gologger.Error().Msgf("Could not create file %s for %s: %s\n", r.options.OutputFile, r.options.Domain, err)
-				return err
-			}
-
-			err = r.EnumerateSingleDomainWithCtx(ctx, domain, append(writers, file))
-
-			file.Close()
-		} else {
-			err = r.EnumerateSingleDomainWithCtx(ctx, domain, writers)
-		}
+	// If OutputFile is specified, create a MultiWriter to write to both file and stdout
+	if r.options.OutputFile != "" {
+		f, err := os.Create(r.options.OutputFile)
 		if err != nil {
 			return err
 		}
+		defer f.Close()
+		outputWriter = io.MultiWriter(writer, f)
 	}
-	return nil
+
+	var site string
+	if r.options.Domain != "" {
+		site = " site:" + r.options.Domain
+	}
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	// Create error channel to handle errors from goroutines
+	errChan := make(chan error, 1)
+	// Create results channel with buffer size equal to threads
+	resultsChan := make(chan string, r.options.Threads)
+	// Create semaphore for rate limiting
+	semaphore := make(chan struct{}, r.options.Threads)
+
+	// Start a goroutine to handle writing results
+	go func() {
+		for result := range resultsChan {
+			if _, err := outputWriter.Write([]byte(result + "\n")); err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		// Check for any errors from goroutines
+		select {
+		case err := <-errChan:
+			return err
+		default:
+		}
+
+		wg.Add(1)
+		dork := scanner.Text() + site
+
+		// Acquire semaphore
+		semaphore <- struct{}{}
+
+		go func(dork string) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+
+			results, err := r.dorkingAgent.Dork(dork)
+			if err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+				return
+			}
+
+			// Send results to channel
+			for _, result := range results {
+				select {
+				case resultsChan <- result:
+				case err := <-errChan:
+					// If there's an error from another goroutine, propagate it
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+			}
+		}(dork)
+	}
+
+	// Check for scanner errors
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+	// Close the results channel
+	close(resultsChan)
+
+	// Check if there were any errors
+	select {
+	case err := <-errChan:
+		return err
+	default:
+		return nil
+	}
 }
